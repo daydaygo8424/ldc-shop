@@ -3,7 +3,7 @@
 import { auth } from "@/lib/auth"
 import { db } from "@/lib/db"
 import { products, cards, orders, loginUsers } from "@/lib/db/schema"
-import { cancelExpiredOrders } from "@/lib/db/queries"
+import { cancelExpiredOrders, recalcProductAggregates } from "@/lib/db/queries"
 import { generateOrderId, generateSign } from "@/lib/crypto"
 import { eq, sql, and, or, isNull, lt } from "drizzle-orm"
 import { cookies } from "next/headers"
@@ -415,6 +415,11 @@ export async function createOrder(productId: string, quantity: number = 1, email
 
     try {
         await reserveAndCreate();
+        try {
+            await recalcProductAggregates(productId)
+        } catch {
+            // best effort
+        }
     } catch (error: any) {
         if (error?.message === 'stock_locked') {
             return { success: false, error: 'buy.stockLocked' };

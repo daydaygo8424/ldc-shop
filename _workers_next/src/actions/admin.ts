@@ -6,7 +6,7 @@ import { products, cards, reviews, categories } from "@/lib/db/schema"
 import { eq, sql, inArray, and, or, isNull, lte } from "drizzle-orm"
 import { sendTelegramMessage } from "@/lib/notifications"
 import { revalidatePath, revalidateTag } from "next/cache"
-import { setSetting } from "@/lib/db/queries"
+import { setSetting, recalcProductAggregates, recalcProductAggregatesForMany } from "@/lib/db/queries"
 
 // Check Admin Helper
 // Check Admin Helper
@@ -119,6 +119,12 @@ export async function saveProduct(formData: FormData) {
         }
     }
 
+    try {
+        await recalcProductAggregates(id)
+    } catch {
+        // best effort
+    }
+
     revalidatePath('/admin/products')
     revalidatePath('/admin/settings')
     revalidatePath('/')
@@ -190,6 +196,11 @@ export async function addCards(formData: FormData) {
             }))
         )
     }
+    try {
+        await recalcProductAggregates(productId)
+    } catch {
+        // best effort
+    }
 
     revalidatePath('/admin/products')
     revalidatePath('/admin/settings')
@@ -219,6 +230,11 @@ export async function deleteCard(cardId: number) {
     }
 
     await db.delete(cards).where(eq(cards.id, cardId))
+    try {
+        await recalcProductAggregates(card.productId)
+    } catch {
+        // best effort
+    }
 
     revalidatePath('/admin/products')
     revalidatePath('/admin/settings')
@@ -234,8 +250,18 @@ export async function deleteCards(cardIds: number[]) {
     if (!cardIds.length) return
 
     const BATCH_SIZE = 100
+    const productIds: string[] = []
     for (let i = 0; i < cardIds.length; i += BATCH_SIZE) {
         const batch = cardIds.slice(i, i + BATCH_SIZE)
+
+        try {
+            const rows = await db.select({ productId: cards.productId })
+                .from(cards)
+                .where(inArray(cards.id, batch))
+            productIds.push(...rows.map(r => r.productId))
+        } catch {
+            // best effort
+        }
 
         await db.delete(cards)
             .where(
@@ -245,6 +271,11 @@ export async function deleteCards(cardIds: number[]) {
                     or(isNull(cards.reservedAt), lte(cards.reservedAt, new Date(Date.now() - 60 * 1000)))
                 )
             )
+    }
+    try {
+        await recalcProductAggregatesForMany(productIds)
+    } catch {
+        // best effort
     }
 
     revalidatePath('/admin/products')

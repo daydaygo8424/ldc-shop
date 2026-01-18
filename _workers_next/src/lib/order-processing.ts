@@ -4,6 +4,7 @@ import { eq, sql } from "drizzle-orm";
 import { isPaymentOrder } from "@/lib/payment";
 import { notifyAdminPaymentSuccess } from "@/lib/notifications";
 import { sendOrderEmail } from "@/lib/email";
+import { recalcProductAggregates } from "@/lib/db/queries";
 
 export async function processOrderFulfillment(orderId: string, paidAmount: number, tradeNo: string) {
     const order = await db.query.orders.findFirst({
@@ -21,6 +22,14 @@ export async function processOrderFulfillment(orderId: string, paidAmount: numbe
     if (Math.abs(paidAmount - orderMoney) > 0.01) {
         throw new Error(`Amount mismatch! Order: ${orderMoney}, Paid: ${paidAmount}`);
     }
+
+    const refreshAggregates = async () => {
+        try {
+            await recalcProductAggregates(order.productId);
+        } catch {
+            // best effort
+        }
+    };
 
     if (isPaymentOrder(order.productId)) {
         if (order.status === 'pending' || order.status === 'cancelled') {
@@ -47,6 +56,7 @@ export async function processOrderFulfillment(orderId: string, paidAmount: numbe
                 tradeNo: tradeNo
             });
         }
+        await refreshAggregates();
         return { success: true, status: 'processed' };
     }
 
@@ -112,6 +122,7 @@ export async function processOrderFulfillment(orderId: string, paidAmount: numbe
                     }).catch(err => console.error('[Email] Send failed:', err));
                 }
 
+                await refreshAggregates();
                 return { success: true, status: 'processed' };
             } else {
                 // No stock for shared product
@@ -135,6 +146,7 @@ export async function processOrderFulfillment(orderId: string, paidAmount: numbe
                     tradeNo: tradeNo
                 });
 
+                await refreshAggregates();
                 return { success: true, status: 'processed' };
             }
         }
@@ -254,6 +266,7 @@ export async function processOrderFulfillment(orderId: string, paidAmount: numbe
                 tradeNo: tradeNo
             });
         }
+        await refreshAggregates();
         return { success: true, status: 'processed' };
     } else {
         return { success: true, status: 'already_processed' };

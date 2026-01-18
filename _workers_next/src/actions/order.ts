@@ -7,7 +7,7 @@ import { revalidatePath } from "next/cache"
 import { db } from "@/lib/db"
 import { orders, cards } from "@/lib/db/schema"
 import { eq } from "drizzle-orm"
-import { withOrderColumnFallback } from "@/lib/db/queries"
+import { withOrderColumnFallback, recalcProductAggregates } from "@/lib/db/queries"
 import { cookies } from "next/headers"
 
 export async function checkOrderStatus(orderId: string) {
@@ -74,7 +74,7 @@ export async function cancelPendingOrder(orderId: string) {
     const order = await withOrderColumnFallback(async () => {
         return await db.query.orders.findFirst({
             where: eq(orders.orderId, orderId),
-            columns: { userId: true, status: true }
+            columns: { userId: true, status: true, productId: true }
         })
     })
 
@@ -95,6 +95,13 @@ export async function cancelPendingOrder(orderId: string) {
 
         revalidatePath(`/order/${orderId}`)
         revalidatePath('/orders')
+        if (order.productId) {
+            try {
+                await recalcProductAggregates(order.productId)
+            } catch {
+                // best effort
+            }
+        }
         
         return { success: true }
     } catch (e: any) {

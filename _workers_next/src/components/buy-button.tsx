@@ -81,9 +81,9 @@ export function BuyButton({ productId, price, productName, disabled, quantity = 
                 return
             }
 
-            const { url, params } = result
+            const { params } = result
 
-            if (!params || !url) {
+            if (!params) {
                 toast.error(t('common.error'))
                 if (!isNavigatingRef.current) setLoading(false)
                 return
@@ -96,7 +96,7 @@ export function BuyButton({ productId, price, productName, disabled, quantity = 
                 // Submit Form immediately without closing dialog
                 const form = document.createElement('form')
                 form.method = 'POST'
-                form.action = url as string
+                form.action = '/paying'
 
                 Object.entries(params as Record<string, any>).forEach(([k, v]) => {
                     const input = document.createElement('input')

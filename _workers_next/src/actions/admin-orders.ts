@@ -5,11 +5,13 @@ import { cards, orders, refundRequests, loginUsers } from "@/lib/db/schema"
 import { and, eq, sql } from "drizzle-orm"
 import { revalidatePath } from "next/cache"
 import { checkAdmin } from "@/actions/admin"
+import { recalcProductAggregates, recalcProductAggregatesForMany } from "@/lib/db/queries"
 
 export async function markOrderPaid(orderId: string) {
   await checkAdmin()
   if (!orderId) throw new Error("Missing order id")
 
+  const order = await db.query.orders.findFirst({ where: eq(orders.orderId, orderId), columns: { productId: true } })
   await db.update(orders).set({
     status: 'paid',
     paidAt: new Date(),
@@ -18,6 +20,13 @@ export async function markOrderPaid(orderId: string) {
   revalidatePath('/admin/orders')
   revalidatePath(`/admin/orders/${orderId}`)
   revalidatePath(`/order/${orderId}`)
+  if (order?.productId) {
+    try {
+      await recalcProductAggregates(order.productId)
+    } catch {
+      // best effort
+    }
+  }
 }
 
 export async function markOrderDelivered(orderId: string) {
@@ -36,6 +45,13 @@ export async function markOrderDelivered(orderId: string) {
   revalidatePath('/admin/orders')
   revalidatePath(`/admin/orders/${orderId}`)
   revalidatePath(`/order/${orderId}`)
+  if (order?.productId) {
+    try {
+      await recalcProductAggregates(order.productId)
+    } catch {
+      // best effort
+    }
+  }
 }
 
 export async function cancelOrder(orderId: string) {
@@ -46,7 +62,7 @@ export async function cancelOrder(orderId: string) {
   // 1. Refund points if used
   const order = await db.query.orders.findFirst({
     where: eq(orders.orderId, orderId),
-    columns: { userId: true, pointsUsed: true }
+    columns: { userId: true, pointsUsed: true, productId: true }
   })
 
   if (order?.userId && order.pointsUsed && order.pointsUsed > 0) {
@@ -68,6 +84,13 @@ export async function cancelOrder(orderId: string) {
   revalidatePath('/admin/orders')
   revalidatePath(`/admin/orders/${orderId}`)
   revalidatePath(`/order/${orderId}`)
+  if (order?.productId) {
+    try {
+      await recalcProductAggregates(order.productId)
+    } catch {
+      // best effort
+    }
+  }
 }
 
 export async function updateOrderEmail(orderId: string, email: string | null) {
@@ -115,10 +138,18 @@ export async function deleteOrder(orderId: string) {
   await checkAdmin()
   if (!orderId) throw new Error("Missing order id")
 
+  const order = await db.query.orders.findFirst({ where: eq(orders.orderId, orderId), columns: { productId: true } })
   await deleteOneOrder(orderId)
 
   revalidatePath('/admin/orders')
   revalidatePath(`/admin/orders/${orderId}`)
+  if (order?.productId) {
+    try {
+      await recalcProductAggregates(order.productId)
+    } catch {
+      // best effort
+    }
+  }
 }
 
 export async function deleteOrders(orderIds: string[]) {
@@ -126,11 +157,20 @@ export async function deleteOrders(orderIds: string[]) {
   const ids = (orderIds || []).map((s) => String(s).trim()).filter(Boolean)
   if (!ids.length) return
 
+  const touchedProducts: string[] = []
+
   for (const id of ids) {
+    const order = await db.query.orders.findFirst({ where: eq(orders.orderId, id), columns: { productId: true } })
+    if (order?.productId) touchedProducts.push(order.productId)
     await deleteOneOrder(id)
   }
 
   revalidatePath('/admin/orders')
+  try {
+    await recalcProductAggregatesForMany(touchedProducts)
+  } catch {
+    // best effort
+  }
 }
 
 import { queryOrderStatus } from "@/lib/epay"
@@ -145,8 +185,16 @@ export async function verifyOrderRefundStatus(orderId: string) {
     if (result.success) {
       // status 0 = Refunded
       if (result.status === 0) {
+        const order = await db.query.orders.findFirst({ where: eq(orders.orderId, orderId), columns: { productId: true } })
         await db.update(orders).set({ status: 'refunded' }).where(eq(orders.orderId, orderId))
         revalidatePath('/admin/orders')
+        if (order?.productId) {
+          try {
+            await recalcProductAggregates(order.productId)
+          } catch {
+            // best effort
+          }
+        }
         return { success: true, status: result.status, msg: 'Refunded (Verified)' }
       } else if (result.status === 1) {
         return { success: true, status: result.status, msg: 'Paid (Not Refunded)' }

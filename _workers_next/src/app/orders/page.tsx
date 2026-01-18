@@ -10,7 +10,7 @@ export const dynamic = 'force-dynamic';
 
 export default async function OrdersPage() {
     const session = await auth()
-    if (!session?.user) redirect('/api/auth/signin')
+    if (!session?.user) redirect('/login')
 
     try {
         await cancelExpiredOrders({ userId: session.user.id || undefined })

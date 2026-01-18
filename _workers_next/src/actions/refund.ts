@@ -4,6 +4,7 @@ import { db } from "@/lib/db"
 import { cards, orders, refundRequests, loginUsers } from "@/lib/db/schema"
 import { and, eq, sql, inArray } from "drizzle-orm"
 import { revalidatePath } from "next/cache"
+import { recalcProductAggregates } from "@/lib/db/queries"
 
 export async function getRefundParams(orderId: string) {
     // Auth Check
@@ -78,6 +79,14 @@ export async function markOrderRefunded(orderId: string) {
     revalidatePath('/admin/orders')
     revalidatePath('/admin/refunds')
     revalidatePath(`/order/${orderId}`)
+
+    if (order.productId) {
+        try {
+            await recalcProductAggregates(order.productId)
+        } catch {
+            // best effort
+        }
+    }
 
     return { success: true }
 }

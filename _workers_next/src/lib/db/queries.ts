@@ -19,6 +19,8 @@ async function safeAddColumn(table: string, column: string, definition: string) 
 async function ensureIndexes() {
     const indexStatements = [
         `CREATE INDEX IF NOT EXISTS products_active_sort_idx ON products(is_active, sort_order, created_at)`,
+        `CREATE INDEX IF NOT EXISTS products_stock_count_idx ON products(stock_count)`,
+        `CREATE INDEX IF NOT EXISTS products_sold_count_idx ON products(sold_count)`,
         `CREATE INDEX IF NOT EXISTS cards_product_used_reserved_idx ON cards(product_id, is_used, reserved_at)`,
         `CREATE INDEX IF NOT EXISTS cards_reserved_order_idx ON cards(reserved_order_id)`,
         `CREATE INDEX IF NOT EXISTS orders_status_paid_at_idx ON orders(status, paid_at)`,
@@ -55,6 +57,7 @@ async function ensureDatabaseInitialized() {
         await ensureProductsColumns();
         await migrateTimestampColumnsToMs();
         await ensureIndexes();
+        await backfillProductAggregates();
 
         dbInitialized = true;
         return;
@@ -80,6 +83,9 @@ async function ensureDatabaseInitialized() {
             sort_order INTEGER DEFAULT 0,
             purchase_limit INTEGER,
             purchase_warning TEXT,
+            stock_count INTEGER DEFAULT 0,
+            locked_count INTEGER DEFAULT 0,
+            sold_count INTEGER DEFAULT 0,
             created_at INTEGER DEFAULT (unixepoch() * 1000)
         );
         
@@ -181,6 +187,7 @@ async function ensureDatabaseInitialized() {
 
     await migrateTimestampColumnsToMs();
     await ensureIndexes();
+    await backfillProductAggregates();
 
     dbInitialized = true;
     console.log("Database initialized successfully");
@@ -191,12 +198,131 @@ async function ensureProductsColumns() {
     await safeAddColumn('products', 'is_hot', 'INTEGER DEFAULT 0');
     await safeAddColumn('products', 'purchase_warning', 'TEXT');
     await safeAddColumn('products', 'is_shared', 'INTEGER DEFAULT 0');
+    await safeAddColumn('products', 'stock_count', 'INTEGER DEFAULT 0');
+    await safeAddColumn('products', 'locked_count', 'INTEGER DEFAULT 0');
+    await safeAddColumn('products', 'sold_count', 'INTEGER DEFAULT 0');
 }
 
 async function ensureOrdersColumns() {
     await safeAddColumn('orders', 'points_used', 'INTEGER DEFAULT 0 NOT NULL');
     await safeAddColumn('orders', 'current_payment_id', 'TEXT');
     await safeAddColumn('orders', 'payee', 'TEXT');
+}
+
+async function isProductAggregatesBackfilled(): Promise<boolean> {
+    try {
+        const result = await db.select({ value: settings.value })
+            .from(settings)
+            .where(eq(settings.key, 'product_aggregates_backfilled'));
+        return result[0]?.value === '1';
+    } catch (error: any) {
+        if (isMissingTable(error)) {
+            await ensureSettingsTable();
+            return false;
+        }
+        throw error;
+    }
+}
+
+async function markProductAggregatesBackfilled() {
+    await db.insert(settings).values({
+        key: 'product_aggregates_backfilled',
+        value: '1',
+        updatedAt: new Date()
+    }).onConflictDoUpdate({
+        target: settings.key,
+        set: { value: '1', updatedAt: new Date() }
+    });
+}
+
+export async function recalcProductAggregates(productId: string) {
+    const pid = (productId || '').trim();
+    if (!pid) return;
+
+    try {
+        await ensureProductsColumns();
+    } catch (error: any) {
+        if (isMissingTableOrColumn(error)) return;
+        throw error;
+    }
+
+    const product = await db.query.products.findFirst({
+        where: eq(products.id, pid),
+        columns: { isShared: true }
+    });
+    if (!product) return;
+
+    const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
+    let unusedCount = 0;
+    let availableCount = 0;
+    let lockedCount = 0;
+
+    try {
+        const cardRows = await db.select({
+            unused: sql<number>`COALESCE(SUM(CASE WHEN COALESCE(${cards.isUsed}, 0) = 0 THEN 1 ELSE 0 END), 0)`,
+            available: sql<number>`COALESCE(SUM(CASE WHEN COALESCE(${cards.isUsed}, 0) = 0 AND (${cards.reservedAt} IS NULL OR ${cards.reservedAt} < ${fiveMinutesAgo}) THEN 1 ELSE 0 END), 0)`,
+            locked: sql<number>`COALESCE(SUM(CASE WHEN COALESCE(${cards.isUsed}, 0) = 0 AND ${cards.reservedAt} IS NOT NULL AND ${cards.reservedAt} >= ${fiveMinutesAgo} THEN 1 ELSE 0 END), 0)`
+        })
+            .from(cards)
+            .where(eq(cards.productId, pid));
+
+        const row = cardRows[0];
+        unusedCount = Number(row?.unused || 0);
+        availableCount = Number(row?.available || 0);
+        lockedCount = Number(row?.locked || 0);
+    } catch (error: any) {
+        if (!isMissingTableOrColumn(error)) throw error;
+    }
+
+    let soldCount = 0;
+    try {
+        const soldRows = await db.select({
+            total: sql<number>`COALESCE(SUM(CASE WHEN ${orders.status} IN ('paid', 'delivered') THEN ${orders.quantity} ELSE 0 END), 0)`
+        })
+            .from(orders)
+            .where(eq(orders.productId, pid));
+        soldCount = Number(soldRows[0]?.total || 0);
+    } catch (error: any) {
+        if (!isMissingTableOrColumn(error)) throw error;
+    }
+
+    const stockCount = product.isShared ? (unusedCount > 0 ? 999999 : 0) : availableCount;
+
+    await db.update(products)
+        .set({
+            stockCount,
+            lockedCount,
+            soldCount
+        })
+        .where(eq(products.id, pid));
+}
+
+export async function recalcProductAggregatesForMany(productIds: string[]) {
+    const ids = Array.from(new Set((productIds || []).map((id) => String(id).trim()).filter(Boolean)));
+    if (!ids.length) return;
+    for (const id of ids) {
+        try {
+            await recalcProductAggregates(id);
+        } catch {
+            // best effort
+        }
+    }
+}
+
+async function backfillProductAggregates() {
+    const already = await isProductAggregatesBackfilled();
+    if (already) return;
+
+    try {
+        await ensureProductsColumns();
+        const rows = await db.select({ id: products.id }).from(products);
+        for (const row of rows) {
+            await recalcProductAggregates(row.id);
+        }
+        await markProductAggregatesBackfilled();
+    } catch (error: any) {
+        if (!isMissingTableOrColumn(error)) throw error;
+    }
 }
 
 async function withProductColumnFallback<T>(fn: () => Promise<T>): Promise<T> {
@@ -230,7 +356,6 @@ export async function withOrderColumnFallback<T>(fn: () => Promise<T>): Promise<
 
 export async function getProducts() {
     return await withProductColumnFallback(async () => {
-        const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
         return await db.select({
             id: products.id,
             name: products.name,
@@ -244,13 +369,11 @@ export async function getProducts() {
             isShared: products.isShared,
             sortOrder: products.sortOrder,
             purchaseLimit: products.purchaseLimit,
-            stock: sql<number>`CASE WHEN ${products.isShared} = 1 THEN (CASE WHEN count(case when ${cards.id} IS NOT NULL AND COALESCE(${cards.isUsed}, 0) = 0 then 1 end) > 0 THEN 999999 ELSE 0 END) ELSE count(case when ${cards.id} IS NOT NULL AND COALESCE(${cards.isUsed}, 0) = 0 AND (${cards.reservedAt} IS NULL OR ${cards.reservedAt} < ${fiveMinutesAgo}) then 1 end) END`,
-            locked: sql<number>`count(case when ${cards.id} IS NOT NULL AND COALESCE(${cards.isUsed}, 0) = 0 AND (${cards.reservedAt} >= ${fiveMinutesAgo}) then 1 end)`,
-            sold: sql<number>`(SELECT COALESCE(SUM(${orders.quantity}), 0) FROM ${orders} WHERE ${orders.productId} = ${products.id} AND ${orders.status} IN ('paid', 'delivered'))`
+            stock: sql<number>`COALESCE(${products.stockCount}, 0)`,
+            locked: sql<number>`COALESCE(${products.lockedCount}, 0)`,
+            sold: sql<number>`COALESCE(${products.soldCount}, 0)`
         })
             .from(products)
-            .leftJoin(cards, eq(products.id, cards.productId))
-            .groupBy(products.id)
             .orderBy(asc(products.sortOrder), desc(products.createdAt));
     })
 }
@@ -261,7 +384,6 @@ export async function getActiveProducts() {
     await ensureDatabaseInitialized();
 
     return await withProductColumnFallback(async () => {
-        const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
         return await db.select({
             id: products.id,
             name: products.name,
@@ -273,21 +395,18 @@ export async function getActiveProducts() {
             isHot: products.isHot,
             isShared: products.isShared,
             purchaseLimit: products.purchaseLimit,
-            stock: sql<number>`CASE WHEN ${products.isShared} = 1 THEN (CASE WHEN count(case when ${cards.id} IS NOT NULL AND COALESCE(${cards.isUsed}, 0) = 0 then 1 end) > 0 THEN 999999 ELSE 0 END) ELSE count(case when ${cards.id} IS NOT NULL AND COALESCE(${cards.isUsed}, 0) = 0 AND (${cards.reservedAt} IS NULL OR ${cards.reservedAt} < ${fiveMinutesAgo}) then 1 end) END`,
-            locked: sql<number>`count(case when ${cards.id} IS NOT NULL AND COALESCE(${cards.isUsed}, 0) = 0 AND (${cards.reservedAt} >= ${fiveMinutesAgo}) then 1 end)`,
-            sold: sql<number>`(SELECT COALESCE(SUM(${orders.quantity}), 0) FROM ${orders} WHERE ${orders.productId} = ${products.id} AND ${orders.status} IN ('paid', 'delivered'))`
+            stock: sql<number>`COALESCE(${products.stockCount}, 0)`,
+            locked: sql<number>`COALESCE(${products.lockedCount}, 0)`,
+            sold: sql<number>`COALESCE(${products.soldCount}, 0)`
         })
             .from(products)
-            .leftJoin(cards, eq(products.id, cards.productId))
             .where(eq(products.isActive, true))
-            .groupBy(products.id)
             .orderBy(asc(products.sortOrder), desc(products.createdAt));
     })
 }
 
 export async function getProduct(id: string) {
     return await withProductColumnFallback(async () => {
-        const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
         const result = await db.select({
             id: products.id,
             name: products.name,
@@ -301,13 +420,12 @@ export async function getProduct(id: string) {
             isShared: products.isShared,
             purchaseLimit: products.purchaseLimit,
             purchaseWarning: products.purchaseWarning,
-            stock: sql<number>`CASE WHEN ${products.isShared} = 1 THEN (CASE WHEN count(case when ${cards.id} IS NOT NULL AND COALESCE(${cards.isUsed}, 0) = 0 then 1 end) > 0 THEN 999999 ELSE 0 END) ELSE count(case when ${cards.id} IS NOT NULL AND COALESCE(${cards.isUsed}, 0) = 0 AND (${cards.reservedAt} IS NULL OR ${cards.reservedAt} < ${fiveMinutesAgo}) then 1 end) END`,
-            locked: sql<number>`count(case when ${cards.id} IS NOT NULL AND COALESCE(${cards.isUsed}, 0) = 0 AND (${cards.reservedAt} >= ${fiveMinutesAgo}) then 1 end)`
+            stock: sql<number>`COALESCE(${products.stockCount}, 0)`,
+            locked: sql<number>`COALESCE(${products.lockedCount}, 0)`
         })
             .from(products)
-            .leftJoin(cards, eq(products.id, cards.productId))
             .where(eq(products.id, id))
-            .groupBy(products.id);
+            ;
 
         // Return null if product doesn't exist or is inactive
         const product = result[0];
@@ -479,10 +597,10 @@ export async function searchActiveProducts(params: {
             orderByParts.push(desc(products.price))
             break
         case 'stockDesc':
-            orderByParts.push(desc(sql<number>`count(case when ${cards.isUsed} = 0 then 1 end)`))
+            orderByParts.push(desc(sql<number>`COALESCE(${products.stockCount}, 0) + COALESCE(${products.lockedCount}, 0)`))
             break
         case 'soldDesc':
-            orderByParts.push(desc(sql<number>`(SELECT COALESCE(SUM(${orders.quantity}), 0) FROM ${orders} WHERE ${orders.productId} = ${products.id} AND ${orders.status} IN ('paid', 'delivered'))`))
+            orderByParts.push(desc(sql<number>`COALESCE(${products.soldCount}, 0)`))
             break
         case 'hot':
             orderByParts.push(desc(sql<number>`case when ${products.isHot} = 1 then 1 else 0 end`))
@@ -494,7 +612,6 @@ export async function searchActiveProducts(params: {
     }
 
     const [items, totalRes] = await withProductColumnFallback(async () => {
-        const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
         const rowsPromise = db.select({
             id: products.id,
             name: products.name,
@@ -505,14 +622,12 @@ export async function searchActiveProducts(params: {
             category: products.category,
             isHot: products.isHot,
             purchaseLimit: products.purchaseLimit,
-            stock: sql<number>`CASE WHEN ${products.isShared} = 1 THEN (CASE WHEN count(case when ${cards.id} IS NOT NULL AND COALESCE(${cards.isUsed}, 0) = 0 then 1 end) > 0 THEN 999999 ELSE 0 END) ELSE count(case when ${cards.id} IS NOT NULL AND COALESCE(${cards.isUsed}, 0) = 0 AND (${cards.reservedAt} IS NULL OR ${cards.reservedAt} < ${fiveMinutesAgo}) then 1 end) END`,
-            locked: sql<number>`count(case when ${cards.id} IS NOT NULL AND COALESCE(${cards.isUsed}, 0) = 0 AND (${cards.reservedAt} >= ${fiveMinutesAgo}) then 1 end)`,
-            sold: sql<number>`(SELECT COALESCE(SUM(${orders.quantity}), 0) FROM ${orders} WHERE ${orders.productId} = ${products.id} AND ${orders.status} IN ('paid', 'delivered'))`
+            stock: sql<number>`COALESCE(${products.stockCount}, 0)`,
+            locked: sql<number>`COALESCE(${products.lockedCount}, 0)`,
+            sold: sql<number>`COALESCE(${products.soldCount}, 0)`
         })
             .from(products)
-            .leftJoin(cards, eq(products.id, cards.productId))
             .where(whereExpr)
-            .groupBy(products.id)
             .orderBy(...orderByParts)
             .limit(pageSize)
             .offset(offset)
@@ -882,6 +997,15 @@ export async function cancelExpiredOrders(filters: { productId?: string; userId?
             } catch (error: any) {
                 if (!isMissingTableOrColumn(error)) throw error;
             }
+        }
+
+        try {
+            const productRows = await db.select({ productId: orders.productId })
+                .from(orders)
+                .where(inArray(orders.orderId, orderIds));
+            await recalcProductAggregatesForMany(productRows.map(r => r.productId));
+        } catch {
+            // best effort
         }
 
         return orderIds;

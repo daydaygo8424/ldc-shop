@@ -286,10 +286,10 @@ export function OrderContent({ order, canViewKey, isOwner, refundRequest }: Orde
                                             try {
                                                 const { getRetryPaymentParams } = await import("@/actions/checkout")
                                                 const result = await getRetryPaymentParams(order.orderId)
-                                                if (result.success && result.url && result.params) {
+                                                if (result.success && result.params) {
                                                     const form = document.createElement('form')
                                                     form.method = 'POST'
-                                                    form.action = result.url
+                                                    form.action = '/paying'
                                                     Object.entries(result.params).forEach(([k, v]) => {
                                                         const input = document.createElement('input')
                                                         input.type = 'hidden'

@@ -4,6 +4,8 @@ import { db } from "@/lib/db"
 import { sql } from "drizzle-orm"
 import { revalidatePath, revalidateTag } from "next/cache"
 import { checkAdmin } from "@/actions/admin"
+import { recalcProductAggregatesForMany } from "@/lib/db/queries"
+import { products } from "@/lib/db/schema"
 
 async function executeStatement(statement: string) {
     if (!statement.trim()) return
@@ -79,6 +81,9 @@ export async function importData(formData: FormData) {
             sortOrder: 'sort_order',
             purchaseLimit: 'purchase_limit',
             purchaseWarning: 'purchase_warning',
+            stockCount: 'stock_count',
+            lockedCount: 'locked_count',
+            soldCount: 'sold_count',
             createdAt: 'created_at',
             // Cards
             productId: 'product_id',
@@ -164,6 +169,14 @@ export async function importData(formData: FormData) {
 
         // Run repair regardless of insert success to fix any existing data issues
         await repairTimestamps()
+
+        try {
+            const productRows = await db.select({ id: products.id }).from(products);
+            const productIds = productRows.map((r) => r.id).filter(Boolean);
+            await recalcProductAggregatesForMany(productIds);
+        } catch {
+            // best effort
+        }
 
         revalidatePath('/admin')
         revalidateTag('home:products')
