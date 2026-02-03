@@ -212,10 +212,7 @@ export async function createOrder(productId: string, quantity: number = 1, email
 
                         })
 
-                        const text = await resp.text()
-
-
-                        const json = JSON.parse(text)
+                        const json = await resp.json()
                         card_key = json?.id + '@' + json?.token
                     } catch {
                         card_key = "获取失败，请联系管理员"
