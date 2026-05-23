@@ -246,24 +246,9 @@ export async function createOrder(productId: string, quantity: number = 1, email
 
                     // A. Try strictly free card (single atomic UPDATE ... RETURNING)
                     const nowMs = Date.now();
-                    let card_key = "";
-                    // 请求卡密 https://chat.z.ai/api/v1/auths/
-                    try {
-                        const resp = await fetch('https://chat.z.ai/api/v1/auths/', {
-                            method: 'GET',
-                            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Accept-Language': 'zh-CN' },
-
-                        })
-
-                        const json = await resp.json()
-                        card_key = json?.id + '@' + json?.token
-                    } catch {
-                        card_key = "获取失败，请联系管理员"
-                    }
-
                     const claimResult: any = await db.run(sql`
                         UPDATE cards
-                        SET reserved_order_id = ${orderId}, reserved_at = ${nowMs},card_key=${card_key}
+                        SET reserved_order_id = ${orderId}, reserved_at = ${nowMs}
                         WHERE id = (
                             SELECT id FROM cards
                             WHERE product_id = ${productId}
